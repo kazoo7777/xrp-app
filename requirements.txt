@@ -1,0 +1,7 @@
+streamlit
+yfinance
+plotly
+prophet
+google-genai
+python-dotenv
+cmdstanpy
