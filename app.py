@@ -1,7 +1,7 @@
 """
 XRP テクニカル分析・AI予測 Streamlit アプリ
 =============================================
-- ロウソク足チャート + ボリンジャーバンド
+- ロウソク足チャート + ボリンジャーバンド + EMA
 - RSI (14期間)
 - MACD (12, 26, 9)
 - Prophet による将来価格予測
@@ -110,7 +110,7 @@ section[data-testid="stSidebar"] .stSlider label {
 
 
 # ──────────────────────────────────────────────
-# テクニカル指標計算（pandas で手動実装）
+# テクニカル指標計算
 # ──────────────────────────────────────────────
 def calc_bollinger_bands(df: pd.DataFrame, length: int = 20, std: float = 2.0):
     """ボリンジャーバンド"""
@@ -147,28 +147,79 @@ def calc_macd(
     return df
 
 
+def calc_ema(df: pd.DataFrame, periods: tuple) -> pd.DataFrame:
+    """EMA（指数移動平均線）"""
+    for p in periods:
+        df[f"EMA_{p}"] = df["Close"].ewm(span=p, adjust=False).mean()
+    return df
+
+
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """OHLCV データを指定ルールでリサンプリング"""
+    resampled = df.resample(rule).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }).dropna()
+    return resampled
+
+
+# ──────────────────────────────────────────────
+# 足種（タイムフレーム）・期間 設定
+# ──────────────────────────────────────────────
+INTERVAL_OPTIONS = {
+    "1分足": {"interval": "1m", "max_days": 7, "resample": None},
+    "15分足": {"interval": "15m", "max_days": 60, "resample": None},
+    "30分足": {"interval": "30m", "max_days": 60, "resample": None},
+    "1時間足": {"interval": "1h", "max_days": 730, "resample": None},
+    "4時間足": {"interval": "1h", "max_days": 730, "resample": "4h"},
+    "8時間足": {"interval": "1h", "max_days": 730, "resample": "8h"},
+    "日足": {"interval": "1d", "max_days": None, "resample": None},
+    "週足": {"interval": "1wk", "max_days": None, "resample": None},
+    "月足": {"interval": "1mo", "max_days": None, "resample": None},
+}
+
+PERIOD_BY_MAX_DAYS = {
+    7: {"1日": "1d", "5日": "5d"},
+    60: {"5日": "5d", "1ヶ月": "1mo"},
+    730: {"1ヶ月": "1mo", "3ヶ月": "3mo", "6ヶ月": "6mo", "1年": "1y"},
+    None: {"1ヶ月": "1mo", "3ヶ月": "3mo", "6ヶ月": "6mo", "1年": "1y", "3年": "3y", "全期間": "max"},
+}
+
+# EMA カラー設定
+EMA_COLORS = {
+    9: "#FF6B6B",
+    21: "#FFD93D",
+    50: "#6BCB77",
+    100: "#4D96FF",
+    200: "#9B59B6",
+}
+
 # ──────────────────────────────────────────────
 # データ取得
 # ──────────────────────────────────────────────
-PERIOD_OPTIONS = {
-    "1ヶ月": "1mo",
-    "3ヶ月": "3mo",
-    "6ヶ月": "6mo",
-    "1年": "1y",
-    "3年": "3y",
-    "全期間": "max",
-}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_xrp_data(period: str) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_xrp_data(
+    period: str,
+    interval: str = "1d",
+    resample_rule: str = None,
+    ema_periods: tuple = (),
+) -> pd.DataFrame:
     """yfinance で XRP-USD データを取得し、テクニカル指標を付与する"""
     import time
 
-    # リトライ付きでデータ取得（クラウド環境での一時的な失敗に対応）
+    # リトライ付きでデータ取得
     for attempt in range(3):
         try:
-            df = yf.download("XRP-USD", period=period, auto_adjust=True, timeout=30)
+            df = yf.download(
+                "XRP-USD",
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                timeout=30,
+            )
             if not df.empty:
                 break
         except Exception:
@@ -185,9 +236,19 @@ def fetch_xrp_data(period: str) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
+    # リサンプリング（4h / 8h）
+    if resample_rule:
+        df = resample_ohlcv(df, resample_rule)
+
+    # テクニカル指標計算
     df = calc_bollinger_bands(df)
     df = calc_rsi(df)
     df = calc_macd(df)
+
+    # EMA 計算
+    if ema_periods:
+        df = calc_ema(df, ema_periods)
+
     df.dropna(inplace=True)
     return df
 
@@ -207,18 +268,8 @@ MACD_LINE = "#00d4ff"
 SIGNAL_LINE = "#ff9800"
 
 
-def build_analysis_chart(df: pd.DataFrame) -> go.Figure:
-    """ロウソク足 + BB / RSI / MACD の 3 段チャートを生成"""
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.6, 0.2, 0.2],
-        subplot_titles=("XRP-USD  ローソク足 & ボリンジャーバンド", "RSI (14)", "MACD (12, 26, 9)"),
-    )
-
-    # ── Row 1: ロウソク足 ─────────────────────────
+def _add_candlestick(fig, df, row=1):
+    """ロウソク足を追加"""
     fig.add_trace(
         go.Candlestick(
             x=df.index,
@@ -232,125 +283,148 @@ def build_analysis_chart(df: pd.DataFrame) -> go.Figure:
             decreasing_fillcolor=DOWN_COLOR,
             name="XRP-USD",
         ),
-        row=1,
-        col=1,
+        row=row, col=1,
     )
 
-    # ── Row 1: ボリンジャーバンド ──────────────────
+
+def _add_bollinger(fig, df, row=1):
+    """ボリンジャーバンドを追加"""
     fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_Upper"],
-            line=dict(color=BB_LINE, width=1),
-            name="BB Upper",
-            showlegend=False,
-        ),
-        row=1,
-        col=1,
+        go.Scatter(x=df.index, y=df["BB_Upper"], line=dict(color=BB_LINE, width=1),
+                   name="BB Upper", showlegend=False),
+        row=row, col=1,
     )
     fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_Lower"],
-            line=dict(color=BB_LINE, width=1),
-            fill="tonexty",
-            fillcolor=BB_FILL,
-            name="BB Lower",
-            showlegend=False,
-        ),
-        row=1,
-        col=1,
+        go.Scatter(x=df.index, y=df["BB_Lower"], line=dict(color=BB_LINE, width=1),
+                   fill="tonexty", fillcolor=BB_FILL, name="BB Lower", showlegend=False),
+        row=row, col=1,
     )
     fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_Middle"],
-            line=dict(color="rgba(0,212,255,0.35)", width=1, dash="dot"),
-            name="BB Middle",
-            showlegend=False,
-        ),
-        row=1,
-        col=1,
+        go.Scatter(x=df.index, y=df["BB_Middle"],
+                   line=dict(color="rgba(0,212,255,0.35)", width=1, dash="dot"),
+                   name="BB Middle", showlegend=False),
+        row=row, col=1,
     )
 
-    # ── Row 2: RSI ────────────────────────────────
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["RSI"],
-            line=dict(color=RSI_COLOR, width=1.5),
-            name="RSI",
-        ),
-        row=2,
-        col=1,
-    )
-    # 70 / 30 ライン
-    fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,23,68,0.5)", line_width=1, row=2, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,230,118,0.5)", line_width=1, row=2, col=1)
-    fig.add_hrect(y0=30, y1=70, fillcolor="rgba(255,255,255,0.03)", line_width=0, row=2, col=1)
 
-    # ── Row 3: MACD ───────────────────────────────
+def _add_ema(fig, df, ema_periods, row=1):
+    """EMA ラインを追加"""
+    for p in ema_periods:
+        col_name = f"EMA_{p}"
+        if col_name in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df[col_name],
+                    line=dict(color=EMA_COLORS.get(p, "#FFFFFF"), width=1.5),
+                    name=f"EMA {p}",
+                ),
+                row=row, col=1,
+            )
+
+
+def _add_rsi(fig, df, row):
+    """RSI を追加"""
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df["RSI"], line=dict(color=RSI_COLOR, width=1.5), name="RSI"),
+        row=row, col=1,
+    )
+    fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,23,68,0.5)", line_width=1, row=row, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,230,118,0.5)", line_width=1, row=row, col=1)
+    fig.add_hrect(y0=30, y1=70, fillcolor="rgba(255,255,255,0.03)", line_width=0, row=row, col=1)
+
+
+def _add_macd(fig, df, row):
+    """MACD を追加"""
     hist_colors = [UP_COLOR if v >= 0 else DOWN_COLOR for v in df["MACD_Hist"]]
     fig.add_trace(
-        go.Bar(
-            x=df.index,
-            y=df["MACD_Hist"],
-            marker_color=hist_colors,
-            name="Histogram",
-            opacity=0.6,
-        ),
-        row=3,
-        col=1,
+        go.Bar(x=df.index, y=df["MACD_Hist"], marker_color=hist_colors, name="Histogram", opacity=0.6),
+        row=row, col=1,
     )
     fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["MACD"],
-            line=dict(color=MACD_LINE, width=1.5),
-            name="MACD",
-        ),
-        row=3,
-        col=1,
+        go.Scatter(x=df.index, y=df["MACD"], line=dict(color=MACD_LINE, width=1.5), name="MACD"),
+        row=row, col=1,
     )
     fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["MACD_Signal"],
-            line=dict(color=SIGNAL_LINE, width=1.5),
-            name="Signal",
-        ),
-        row=3,
-        col=1,
+        go.Scatter(x=df.index, y=df["MACD_Signal"], line=dict(color=SIGNAL_LINE, width=1.5), name="Signal"),
+        row=row, col=1,
     )
 
-    # ── レイアウト ────────────────────────────────
+
+def _apply_layout(fig, n_rows):
+    """共通レイアウトを適用"""
     fig.update_layout(
         template=CHART_TEMPLATE,
-        height=820,
+        height=550 if n_rows == 2 else 820,
         margin=dict(l=12, r=12, t=40, b=20),
         paper_bgcolor=BG_COLOR,
         plot_bgcolor=BG_COLOR,
         legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.01,
-            xanchor="right",
-            x=1,
+            orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1,
             font=dict(size=11),
         ),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
         font=dict(family="Inter, sans-serif"),
     )
+    for i in range(1, n_rows + 1):
+        xkey = f"xaxis{'' if i == 1 else i}"
+        ykey = f"yaxis{'' if i == 1 else i}"
+        fig.update_layout(**{xkey: dict(gridcolor=GRID_COLOR, showgrid=True)})
+        fig.update_layout(**{ykey: dict(gridcolor=GRID_COLOR, showgrid=True)})
 
-    for ax in ["xaxis", "xaxis2", "xaxis3"]:
-        fig.update_layout(**{ax: dict(gridcolor=GRID_COLOR, showgrid=True)})
-    for ax in ["yaxis", "yaxis2", "yaxis3"]:
-        fig.update_layout(**{ax: dict(gridcolor=GRID_COLOR, showgrid=True)})
 
-    fig.update_yaxes(title_text="価格 (USD)", row=1, col=1)
-    fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
-    fig.update_yaxes(title_text="MACD", row=3, col=1)
+def build_analysis_chart(
+    df: pd.DataFrame,
+    display_mode: str = "全表示",
+    ema_periods: tuple = (),
+    interval_label: str = "日足",
+) -> go.Figure:
+    """表示モードに応じたチャートを生成"""
+
+    if display_mode == "チャート + RSI":
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            row_heights=[0.7, 0.3],
+            subplot_titles=(f"XRP-USD  ローソク足 ({interval_label})", "RSI (14)"),
+        )
+        _add_candlestick(fig, df, row=1)
+        _add_bollinger(fig, df, row=1)
+        _add_ema(fig, df, ema_periods, row=1)
+        _add_rsi(fig, df, row=2)
+        _apply_layout(fig, 2)
+        fig.update_yaxes(title_text="価格 (USD)", row=1, col=1)
+        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
+
+    elif display_mode == "チャート + MACD":
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            row_heights=[0.7, 0.3],
+            subplot_titles=(f"XRP-USD  ローソク足 ({interval_label})", "MACD (12, 26, 9)"),
+        )
+        _add_candlestick(fig, df, row=1)
+        _add_bollinger(fig, df, row=1)
+        _add_ema(fig, df, ema_periods, row=1)
+        _add_macd(fig, df, row=2)
+        _apply_layout(fig, 2)
+        fig.update_yaxes(title_text="価格 (USD)", row=1, col=1)
+        fig.update_yaxes(title_text="MACD", row=2, col=1)
+
+    else:  # 全表示
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+            row_heights=[0.6, 0.2, 0.2],
+            subplot_titles=(f"XRP-USD  ローソク足 ({interval_label})", "RSI (14)", "MACD (12, 26, 9)"),
+        )
+        _add_candlestick(fig, df, row=1)
+        _add_bollinger(fig, df, row=1)
+        _add_ema(fig, df, ema_periods, row=1)
+        _add_rsi(fig, df, row=2)
+        _add_macd(fig, df, row=3)
+        _apply_layout(fig, 3)
+        fig.update_yaxes(title_text="価格 (USD)", row=1, col=1)
+        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
+        fig.update_yaxes(title_text="MACD", row=3, col=1)
 
     return fig
 
@@ -385,10 +459,8 @@ def build_forecast_chart(df: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
     # 実績
     fig.add_trace(
         go.Scatter(
-            x=df.index,
-            y=df["Close"],
-            line=dict(color="#00d4ff", width=1.5),
-            name="実績価格",
+            x=df.index, y=df["Close"],
+            line=dict(color="#00d4ff", width=1.5), name="実績価格",
         )
     )
 
@@ -396,31 +468,23 @@ def build_forecast_chart(df: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
     forecast_only = forecast[forecast["ds"] > df.index[-1]]
     fig.add_trace(
         go.Scatter(
-            x=forecast_only["ds"],
-            y=forecast_only["yhat"],
-            line=dict(color="#7b2ff7", width=2.5),
-            name="予測価格",
+            x=forecast_only["ds"], y=forecast_only["yhat"],
+            line=dict(color="#7b2ff7", width=2.5), name="予測価格",
         )
     )
 
     # 信頼区間
     fig.add_trace(
         go.Scatter(
-            x=forecast_only["ds"],
-            y=forecast_only["yhat_upper"],
-            line=dict(width=0),
-            showlegend=False,
-            name="上限",
+            x=forecast_only["ds"], y=forecast_only["yhat_upper"],
+            line=dict(width=0), showlegend=False, name="上限",
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=forecast_only["ds"],
-            y=forecast_only["yhat_lower"],
-            line=dict(width=0),
-            fill="tonexty",
-            fillcolor="rgba(123,47,247,0.15)",
-            name="信頼区間",
+            x=forecast_only["ds"], y=forecast_only["yhat_lower"],
+            line=dict(width=0), fill="tonexty",
+            fillcolor="rgba(123,47,247,0.15)", name="信頼区間",
         )
     )
 
@@ -434,11 +498,7 @@ def build_forecast_chart(df: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
         xaxis=dict(gridcolor=GRID_COLOR, title="日付"),
         yaxis=dict(gridcolor=GRID_COLOR, title="価格 (USD)"),
         legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.01,
-            xanchor="right",
-            x=1,
+            orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1,
             font=dict(size=11),
         ),
         hovermode="x unified",
@@ -529,14 +589,59 @@ with st.sidebar:
     st.markdown("## ⚙️ 設定")
     st.markdown("---")
 
-    selected_period_label = st.selectbox(
-        "📅 データ取得期間",
-        options=list(PERIOD_OPTIONS.keys()),
-        index=3,  # デフォルト: 1年
+    # ── 足種選択 ─────────────────────────────
+    st.markdown("##### 🕐 足種（タイムフレーム）")
+    selected_interval_label = st.selectbox(
+        "足種",
+        options=list(INTERVAL_OPTIONS.keys()),
+        index=6,  # デフォルト: 日足
+        label_visibility="collapsed",
     )
-    selected_period = PERIOD_OPTIONS[selected_period_label]
+    interval_config = INTERVAL_OPTIONS[selected_interval_label]
+    max_days = interval_config["max_days"]
 
+    # ── 期間選択（足種に応じた制限） ────────
     st.markdown("")
+    st.markdown("##### 📅 データ取得期間")
+    period_options = PERIOD_BY_MAX_DAYS[max_days]
+    period_keys = list(period_options.keys())
+    selected_period_label = st.selectbox(
+        "期間",
+        options=period_keys,
+        index=len(period_keys) - 1,  # デフォルト: 最長期間
+        label_visibility="collapsed",
+    )
+    selected_period = period_options[selected_period_label]
+
+    # ── 表示モード ──────────────────────────
+    st.markdown("")
+    st.markdown("##### 📊 チャート表示")
+    display_mode = st.radio(
+        "表示モード",
+        ["全表示", "チャート + RSI", "チャート + MACD"],
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    # ── EMA 設定 ────────────────────────────
+    st.markdown("")
+    st.markdown("##### 📈 EMA（移動平均線）")
+    ema_periods = st.multiselect(
+        "EMA 期間",
+        options=[9, 21, 50, 100, 200],
+        default=[],
+        format_func=lambda x: f"EMA {x}",
+        label_visibility="collapsed",
+    )
+    if ema_periods:
+        legend_html = " ".join(
+            [f'<span style="color:{EMA_COLORS[p]}; font-weight:bold;">●EMA{p}</span>' for p in sorted(ema_periods)]
+        )
+        st.markdown(f'<div style="font-size:0.8rem;">{legend_html}</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── 予測日数 ────────────────────────────
     forecast_days = st.select_slider(
         "🔮 予測日数",
         options=[7, 14, 30, 60, 90],
@@ -560,11 +665,16 @@ with st.sidebar:
 st.markdown("# 📈 XRP テクニカル分析 & AI予測")
 
 # データ読み込み
-with st.spinner("XRP-USD データを取得中..."):
-    df = fetch_xrp_data(selected_period)
+with st.spinner(f"XRP-USD データを取得中（{selected_interval_label}）..."):
+    df = fetch_xrp_data(
+        period=selected_period,
+        interval=interval_config["interval"],
+        resample_rule=interval_config["resample"],
+        ema_periods=tuple(sorted(ema_periods)),
+    )
 
 if df.empty:
-    st.error("データの取得に失敗しました。インターネット接続を確認してください。")
+    st.error("データの取得に失敗しました。インターネット接続を確認するか、別の足種・期間を選択してください。")
     st.stop()
 
 # メトリクス表示
@@ -581,7 +691,7 @@ with col2:
 with col3:
     st.metric("📉 MACD", f"{latest['MACD']:.6f}")
 with col4:
-    st.metric("📈 24h 出来高", f"{latest['Volume']:,.0f}")
+    st.metric("📈 出来高", f"{latest['Volume']:,.0f}")
 
 st.markdown("")
 
@@ -589,13 +699,28 @@ st.markdown("")
 tab_chart, tab_forecast, tab_gemini = st.tabs(["📊 チャート分析", "🔮 Prophet予測", "🤖 Gemini AI分析"])
 
 with tab_chart:
-    analysis_fig = build_analysis_chart(df)
+    analysis_fig = build_analysis_chart(
+        df,
+        display_mode=display_mode,
+        ema_periods=tuple(sorted(ema_periods)),
+        interval_label=selected_interval_label,
+    )
     st.plotly_chart(analysis_fig, use_container_width=True, config={"scrollZoom": True})
 
     with st.expander("📋 直近データ (20件)"):
-        recent = df.tail(20)[["Open", "High", "Low", "Close", "Volume", "RSI", "MACD"]].copy()
-        recent.columns = ["始値", "高値", "安値", "終値", "出来高", "RSI", "MACD"]
-        st.dataframe(recent.style.format({
+        display_cols = ["Open", "High", "Low", "Close", "Volume", "RSI", "MACD"]
+        # EMA カラムも追加
+        for p in sorted(ema_periods):
+            col_name = f"EMA_{p}"
+            if col_name in df.columns:
+                display_cols.append(col_name)
+
+        recent = df.tail(20)[display_cols].copy()
+        col_names = ["始値", "高値", "安値", "終値", "出来高", "RSI", "MACD"]
+        col_names += [f"EMA{p}" for p in sorted(ema_periods) if f"EMA_{p}" in df.columns]
+        recent.columns = col_names
+
+        fmt = {
             "始値": "${:.4f}",
             "高値": "${:.4f}",
             "安値": "${:.4f}",
@@ -603,42 +728,38 @@ with tab_chart:
             "出来高": "{:,.0f}",
             "RSI": "{:.1f}",
             "MACD": "{:.6f}",
-        }), use_container_width=True)
+        }
+        for p in sorted(ema_periods):
+            if f"EMA{p}" in recent.columns:
+                fmt[f"EMA{p}"] = "${:.4f}"
+
+        st.dataframe(recent.style.format(fmt), use_container_width=True, hide_index=True)
 
 with tab_forecast:
-    with st.spinner(f"Prophet で {forecast_days} 日間の予測を計算中..."):
-        forecast, model = run_prophet(df, forecast_days)
+    # Prophet は日足データが必要
+    st.markdown("### 🔮 Prophet による価格予測")
+    st.caption("※ Prophet 予測は日足データを使用します")
 
-    forecast_fig = build_forecast_chart(df, forecast)
-    st.plotly_chart(forecast_fig, use_container_width=True, config={"scrollZoom": True})
+    with st.spinner("Prophet モデルを構築中..."):
+        # 日足データを取得（予測用）
+        df_daily = fetch_xrp_data(
+            period="1y",
+            interval="1d",
+            resample_rule=None,
+            ema_periods=(),
+        )
 
-    # 予測サマリー
-    forecast_only = forecast[forecast["ds"] > df.index[-1]].copy()
-    if not forecast_only.empty:
-        st.markdown("### 📋 予測サマリー")
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            st.metric(
-                f"📅 {forecast_days}日後 予測価格",
-                f"${forecast_only.iloc[-1]['yhat']:.4f}",
-            )
-        with fc2:
-            st.metric(
-                "⬆️ 上限 (95%)",
-                f"${forecast_only.iloc[-1]['yhat_upper']:.4f}",
-            )
-        with fc3:
-            st.metric(
-                "⬇️ 下限 (95%)",
-                f"${forecast_only.iloc[-1]['yhat_lower']:.4f}",
-            )
+    if not df_daily.empty:
+        forecast, model = run_prophet(df_daily, forecast_days)
+        forecast_fig = build_forecast_chart(df_daily, forecast)
+        st.plotly_chart(forecast_fig, use_container_width=True, config={"scrollZoom": True})
 
-        with st.expander("📊 予測データテーブル"):
-            display_fc = forecast_only[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
-            display_fc.columns = ["日付", "予測価格", "下限", "上限"]
-            display_fc["日付"] = display_fc["日付"].dt.strftime("%Y-%m-%d")
+        forecast_only = forecast[forecast["ds"] > df_daily.index[-1]]
+        with st.expander("📋 予測データ詳細"):
+            display_forecast = forecast_only[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+            display_forecast.columns = ["日付", "予測価格", "下限", "上限"]
             st.dataframe(
-                display_fc.style.format({
+                display_forecast.style.format({
                     "予測価格": "${:.4f}",
                     "下限": "${:.4f}",
                     "上限": "${:.4f}",
@@ -646,6 +767,8 @@ with tab_forecast:
                 use_container_width=True,
                 hide_index=True,
             )
+    else:
+        st.warning("日足データの取得に失敗しました。")
 
 with tab_gemini:
     if not GEMINI_API_KEY or GEMINI_API_KEY == "あなたのAPIキーをここに貼り付けてください":
@@ -687,7 +810,7 @@ with tab_gemini:
                         st.error(
                             f"⚠️ **{gemini_model}** のレート制限に達しました。\n\n"
                             "**対処法:**\n"
-                            "- 別のモデル（`gemini-2.0-flash` 推奨）に切り替えてください\n"
+                            "- 別のモデルに切り替えてください\n"
                             "- しばらく時間を置いてから再試行してください\n"
                             "- [Google AI Studio](https://ai.google.dev/gemini-api/docs/rate-limits) でクォータを確認できます"
                         )
