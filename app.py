@@ -24,9 +24,12 @@ from google import genai
 
 warnings.filterwarnings("ignore")
 
-# .env から API キーを読み込み
+# .env または Streamlit Secrets から API キーを読み込み
 load_dotenv(override=True)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except (KeyError, FileNotFoundError):
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ──────────────────────────────────────────────
 # ページ設定
@@ -160,7 +163,21 @@ PERIOD_OPTIONS = {
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_xrp_data(period: str) -> pd.DataFrame:
     """yfinance で XRP-USD データを取得し、テクニカル指標を付与する"""
-    df = yf.download("XRP-USD", period=period, auto_adjust=True)
+    import time
+
+    # リトライ付きでデータ取得（クラウド環境での一時的な失敗に対応）
+    for attempt in range(3):
+        try:
+            df = yf.download("XRP-USD", period=period, auto_adjust=True, timeout=30)
+            if not df.empty:
+                break
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(2)
+    else:
+        df = pd.DataFrame()
+
     if df.empty:
         return df
 
