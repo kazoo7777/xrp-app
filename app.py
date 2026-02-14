@@ -379,6 +379,7 @@ def build_analysis_chart(
     display_mode: str = "全表示",
     ema_periods: tuple = (),
     interval_label: str = "日足",
+    visible_candles: int = 70,
 ) -> go.Figure:
     """表示モードに応じたチャートを生成"""
 
@@ -425,6 +426,18 @@ def build_analysis_chart(
         fig.update_yaxes(title_text="価格 (USD)", row=1, col=1)
         fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
         fig.update_yaxes(title_text="MACD", row=3, col=1)
+
+    # デフォルト表示範囲を最新 N 本に設定（ズーム操作で自由に変更可）
+    if len(df) > visible_candles:
+        x_start = df.index[-visible_candles]
+        x_end = df.index[-1]
+        # 表示範囲内のデータでY軸の範囲を計算
+        visible_df = df.iloc[-visible_candles:]
+        y_min = float(visible_df["Low"].min())
+        y_max = float(visible_df["High"].max())
+        y_margin = (y_max - y_min) * 0.05
+        fig.update_xaxes(range=[x_start, x_end])
+        fig.update_yaxes(range=[y_min - y_margin, y_max + y_margin], row=1, col=1)
 
     return fig
 
@@ -623,6 +636,19 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
+    # ── 表示本数（ズーム） ───────────────────
+    st.markdown("")
+    st.markdown("##### 🔍 表示ロウソク足本数")
+    visible_candles = st.slider(
+        "表示本数",
+        min_value=20,
+        max_value=300,
+        value=70,
+        step=10,
+        label_visibility="collapsed",
+        help="チャートに表示するロウソク足の本数を調整します。少ないほど大きく表示されます。",
+    )
+
     # ── EMA 設定 ────────────────────────────
     st.markdown("")
     st.markdown("##### 📈 EMA（移動平均線）")
@@ -704,6 +730,7 @@ with tab_chart:
         display_mode=display_mode,
         ema_periods=tuple(sorted(ema_periods)),
         interval_label=selected_interval_label,
+        visible_candles=visible_candles,
     )
     st.plotly_chart(analysis_fig, use_container_width=True, config={"scrollZoom": True})
 
