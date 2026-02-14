@@ -42,6 +42,52 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────
+# 認証機能
+# ──────────────────────────────────────────────
+import hmac
+
+def check_password():
+    """パスワード認証を行う"""
+    def login_form():
+        """ログインフォームを表示"""
+        with st.form("credentials"):
+            st.text_input("ユーザー名", key="username")
+            st.text_input("パスワード", type="password", key="password")
+            st.form_submit_button("ログイン", on_click=password_entered)
+
+    def password_entered():
+        """パスワード認証ロジック"""
+        if "username" in st.session_state and "password" in st.session_state:
+            user = st.session_state["username"]
+            pwd = st.session_state["password"]
+            
+            if user in st.secrets["passwords"] and hmac.compare_digest(
+                pwd, st.secrets["passwords"][user]
+            ):
+                st.session_state["password_correct"] = True
+                # パスワードをセッションから削除（セキュリティ対策）
+                del st.session_state["password"]
+            else:
+                st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # 初回表示またはログアウト後
+    st.markdown("# 🔐 ログインが必要です")
+    login_form()
+    
+    if "password_correct" in st.session_state:
+        if not st.session_state["password_correct"]:
+            st.error("ユーザー名またはパスワードが間違っています。")
+            
+    return False
+
+if not check_password():
+    st.stop()
+
+
+# ──────────────────────────────────────────────
 # カスタムCSS
 # ──────────────────────────────────────────────
 st.markdown(
