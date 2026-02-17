@@ -571,33 +571,54 @@ def build_forecast_chart(df: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
 # Gemini AI 分析
 # ──────────────────────────────────────────────
 GEMINI_PROMPT_TEMPLATE = """
-あなたは暗号資産（仮想通貨）の専門アナリストです。
-以下の XRP-USD のテクニカルデータを分析し、今後 {forecast_days} 日間の値動きを予測してください。
+あなたは経験豊富な暗号資産専門のテクニカルアナリストです。
+提供された XRP-USD のデータに基づき、感情を排した論理的な市場分析レポートを作成してください。
 
-## 現在の市場データ
+## 入力データ
+### 現在の市場概況
 - 現在価格: ${current_price:.4f}
 - 24時間変動: {price_change_pct:+.2f}%
 - 24時間出来高: {volume:,.0f}
+- ボリンジャーバンド(20): 上限 ${bb_upper:.4f} / 下限 ${bb_lower:.4f} (現在の位置: {bb_status})
 
-## テクニカル指標（最新値）
+### 主要テクニカル指標
 - RSI (14): {rsi:.1f}
-- MACD: {macd:.6f}
-- MACD シグナル: {macd_signal:.6f}
-- MACD ヒストグラム: {macd_hist:.6f}
-- ボリンジャーバンド 上限: ${bb_upper:.4f}
-- ボリンジャーバンド 中央: ${bb_middle:.4f}
-- ボリンジャーバンド 下限: ${bb_lower:.4f}
+- MACD: ヒストグラム {macd_hist:.4f} (シグナル: {macd_signal:.4f}, MACD線: {macd:.4f})
 
-## 直近 30 日間の価格推移
+### 直近30日間の価格・指標推移
 {price_history}
 
-## 依頼内容
-1. 上記のテクニカル指標を総合的に分析し、現在の市場状況を評価してください。
-2. 今後 {forecast_days} 日間の予測される値動き（上昇・下落・横ばい）とその理由を解説してください。
-3. 投資家が注意すべきリスクや重要なサポート・レジスタンスラインがあれば指摘してください。
-4. 全て日本語で回答してください。
+## 分析タスク（思考プロセス）
+以下の手順でステップ・バイ・ステップで分析を行ってください。
+1. **トレンド判定**: 短期および中期のトレンドが「上昇・下降・レンジ」のどれにあるか定義する。
+2. **パターン認識**: 直近の価格変動から、反転パターン（ダブルボトムなど）や継続パターンが見られるか確認する。特に直近の急騰・急落後の動きを評価する。
+3. **指標分析**: RSIのダイバージェンスやMACDのゴールデンクロスの可能性を探る。
+4. **シナリオ構築**: メインシナリオ（確率高）とサブシナリオ（リスク要因）を構築する。
 
-※ これは参考情報であり、投資助言ではありません。
+## 出力形式（以下の見出しに従って回答してください）
+
+### 1. 市場状況の要約（簡潔に）
+[ここに現状のトレンド分析を記述]
+
+### 2. 今後の値動き予測
+**【短期予測（今後1週間）】**
+* 予想トレンド: [上昇 / 横ばい / 下落]
+* 注目価格帯: $X.XX ～ $X.XX
+* 根拠: [テクニカル的な理由]
+
+**【中期予測（今後30日間）】**
+* 予想トレンド: [上昇 / 横ばい / 下落]
+* ターゲット価格: $X.XX
+* 解説: [より大きな視点での解説]
+
+### 3. クリティカル・プライスレベル
+* **レジスタンス（上値抵抗線）**: $X.XX (根拠: ボリンジャーバンド中央線など)
+* **サポート（下値支持線）**: $X.XX (根拠: 直近安値など)
+
+### 4. アナリストの助言（注意点）
+[投資家が警戒すべきリスクや、注目すべき指標の変化について]
+
+※免責事項: 本分析はテクニカル指標に基づくシミュレーションであり、投資助言ではありません。
 """
 
 
@@ -607,12 +628,29 @@ def build_gemini_prompt(df: pd.DataFrame, forecast_days: int) -> str:
     prev = df.iloc[-2]
     price_change_pct = ((latest["Close"] - prev["Close"]) / prev["Close"]) * 100
 
-    # 直近 30 日の価格推移テーブル
-    recent = df.tail(30)[["Close", "RSI", "MACD"]].copy()
+    # ボリンジャーバンドの位置判定
+    bb_status = "バンド内推移"
+    if latest["Close"] >= latest["BB_Upper"]:
+        bb_status = "バンド上限付近（買われすぎ警戒）"
+    elif latest["Close"] <= latest["BB_Lower"]:
+        bb_status = "バンド下限付近（売られすぎ警戒）"
+    elif latest["Close"] > latest["BB_Middle"]:
+        bb_status = "バンド中央より上（強気示唆）"
+    else:
+        bb_status = "バンド中央より下（弱気示唆）"
+
+    # 直近 30 日の価格推移テーブル（高値・安値追加）
+    recent = df.tail(30).copy()
     price_lines = []
-    for date, row in recent.iterrows():
+    # 新しい日付順（降順）にするために逆順でループ
+    for date, row in recent.iloc[::-1].iterrows():
         d = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
-        price_lines.append(f"{d}: 終値=${row['Close']:.4f}  RSI={row['RSI']:.1f}  MACD={row['MACD']:.6f}")
+        line = (
+            f"{d}: 終値=${row['Close']:.4f} "
+            f"(高値=${row['High']:.4f}, 安値=${row['Low']:.4f}) "
+            f"RSI={row['RSI']:.1f} MACD Hist={row['MACD_Hist']:.6f}"
+        )
+        price_lines.append(line)
     price_history = "\n".join(price_lines)
 
     return GEMINI_PROMPT_TEMPLATE.format(
@@ -627,6 +665,7 @@ def build_gemini_prompt(df: pd.DataFrame, forecast_days: int) -> str:
         bb_upper=latest["BB_Upper"],
         bb_middle=latest["BB_Middle"],
         bb_lower=latest["BB_Lower"],
+        bb_status=bb_status,
         price_history=price_history,
     )
 
